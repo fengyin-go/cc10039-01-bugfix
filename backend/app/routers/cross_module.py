@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from app.services import service_for, SERVICES
 from app.store import store
@@ -18,8 +19,23 @@ from app.services.file_compaction import FileCompactionService
 from app.services.retention_mgr import RetentionMgrService
 from app.services.backfill_job import BackfillJobService
 from app.services.govern_report import GovernReportService
+from app.services.quality_monitor import QualityMonitorService
 
 router = APIRouter(prefix="/api/cross", tags=["跨模块编排"])
+
+
+class PipelineCompletionPayload(BaseModel):
+    """管道完工上报：实际写入量必填，批号缺省时由管道生成。"""
+
+    pipeline_id: int
+    record_count: int = Field(ge=0)
+    batch_no: str | None = None
+
+
+class QualityCheckPayload(BaseModel):
+    """质量检查编排：按监控规则启动或完成检查。"""
+
+    rule_id: int
 
 
 @router.get("/events")
@@ -54,6 +70,85 @@ def list_snapshots() -> dict[str, Any]:
 def cross_module_overview() -> dict[str, Any]:
     """跨模块统计概览。"""
     return store.cross_module_stats()
+
+
+@router.get("/ingest-batches")
+def list_ingest_batches(
+    table_name: str | None = Query(default=None),
+    pipeline_id: int | None = Query(default=None),
+    batch_no: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """入湖批次回执清单：管道完工上报的批号与实际写入量。
+
+    供管道工作台复核批次与行数；同批回执重复提交只登记一次。
+    """
+    batches = QualityMonitorService().batch_receipts()
+    if table_name:
+        batches = [b for b in batches if str(b.get("table_name", "")).casefold() == table_name.casefold()]
+    if pipeline_id is not None:
+        batches = [b for b in batches if b.get("pipeline_id") == pipeline_id]
+    if batch_no:
+        batches = [b for b in batches if b.get("batch_no") == batch_no]
+    return {"total": len(batches), "items": batches}
+
+
+@router.get("/quality-checks")
+def list_quality_checks(
+    rule_id: int | None = Query(default=None),
+    table_name: str | None = Query(default=None),
+    batch_no: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """质量检查详情：每条检查记录锁定一个已完成批次，行数以该批次回执为准。"""
+    records = QualityMonitorService().check_records()
+    if rule_id is not None:
+        records = [r for r in records if r.get("rule_id") == rule_id]
+    if table_name:
+        records = [r for r in records if str(r.get("table_name", "")).casefold() == table_name.casefold()]
+    if batch_no:
+        records = [r for r in records if r.get("batch_no") == batch_no]
+    return {"total": len(records), "items": records}
+
+
+@router.get("/quality-alerts")
+def list_quality_alerts(
+    table_name: str | None = Query(default=None),
+    batch_no: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """质量告警清单：每条告警保留其原批次来源。"""
+    alerts = QualityMonitorService().alerts()
+    if table_name:
+        alerts = [a for a in alerts if str(a.get("table_name", "")).casefold() == table_name.casefold()]
+    if batch_no:
+        alerts = [a for a in alerts if a.get("batch_no") == batch_no]
+    return {"total": len(alerts), "items": alerts}
+
+
+@router.post("/pipeline-completions")
+def report_pipeline_completion(payload: PipelineCompletionPayload) -> dict[str, Any]:
+    """管道完工上报：生成批号，把批号和实际写入量报送质量监控。
+
+    同批完成回执重复提交时幂等处理，质量核验只记一次。
+    """
+    service = service_for("ingest_pipeline")
+    if service is None:
+        raise HTTPException(status_code=404, detail="入湖管道模块未注册")
+    entry, message = service.complete_pipeline(
+        payload.pipeline_id, payload.record_count, batch_no=payload.batch_no)
+    return {"ok": entry is not None, "message": message, "entry": entry}
+
+
+@router.post("/quality-checks/start")
+def start_quality_check(payload: QualityCheckPayload) -> dict[str, Any]:
+    """启动质量检查：锁定目标湖表最新一个已完成且未核验的入湖批次。"""
+    record, message = QualityMonitorService().start_check(payload.rule_id)
+    return {"ok": record is not None, "message": message, "record": record}
+
+
+@router.post("/quality-checks/finish")
+def finish_quality_check(payload: QualityCheckPayload) -> dict[str, Any]:
+    """完成质量检查：按锁定批次回执出具判定，回写原管道并联动脉络。"""
+    record, message = QualityMonitorService().finish_check(payload.rule_id)
+    return {"ok": record is not None, "message": message, "record": record}
 
 
 @router.get("/pipeline-status")

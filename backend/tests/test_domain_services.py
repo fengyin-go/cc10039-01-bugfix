@@ -374,6 +374,14 @@ class TestQualityMonitor:
         for qm_id in [1, 2, 3]:
             qm = store.find("quality_monitor", qm_id)
             if qm and qm["status"] == "已启用":
+                # 为该规则的目标湖表补一条入湖批次回执，检查才有口径来源
+                self.svc.receive_batch_receipt({
+                    "batch_no": f"BATCH-TEST-QM-{qm_id}",
+                    "pipeline_id": 0,
+                    "pipeline_name": "测试管道",
+                    "table_name": qm.get("目标湖表", ""),
+                    "record_count": 10,
+                })
                 entry, msg = self.svc.check_quality(qm_id)
                 assert entry is not None
                 assert isinstance(msg, str)
@@ -647,3 +655,203 @@ class TestCrossModulePipeline:
             assert svc.ENTITY, f"{type(svc).__name__} missing ENTITY"
             assert svc.LIST_FIELDS, f"{type(svc).__name__} missing LIST_FIELDS"
             assert svc.STATUS_ORDER, f"{type(svc).__name__} missing STATUS_ORDER"
+
+
+class TestIngestBatchQualityFlow:
+    """入湖批次质量判定：批次回执、检查口径、幂等与血缘联动。
+
+    验收场景：同一目标表先后完成 39 行和 101 行两批写入，检查在两次
+    完成之间启动；另一张表同期完成一批。检查记录与管道回执必须引用
+    同一个已完成批次，其它写入不得混入行数；同批回执重复提交只核验
+    一次，告警保留原批次来源。
+    """
+
+    def setup_method(self):
+        self.lake_svc = LakeTableService()
+        self.ingest_svc = IngestPipelineService()
+        self.quality_svc = QualityMonitorService()
+        self.lineage_svc = LineageGraphService()
+
+    def _register_table(self, name: str) -> int:
+        entry, missing = self.lake_svc.create_entry({
+            "表名": name, "所属业务域": "批次核验域", "存储格式": "parquet",
+        })
+        assert entry is not None and not missing
+        result, msg = self.lake_svc.register_table(entry["id"])
+        assert result is not None, msg
+        return entry["id"]
+
+    def _enable_rule(self, name: str, table: str, threshold: int) -> int:
+        entry, missing = self.quality_svc.create_entry({
+            "规则名称": name, "监控指标": "入湖行数", "告警阈值": str(threshold),
+            "目标湖表": table, "检查频率": "每批",
+        })
+        assert entry is not None and not missing
+        result, msg = self.quality_svc.enable_monitor(entry["id"])
+        assert result is not None, msg
+        return entry["id"]
+
+    def _run_pipeline(self, name: str, table: str, count: int) -> tuple[int, str]:
+        entry, missing = self.ingest_svc.create_entry({
+            "任务名称": name, "来源系统": "crm", "目标湖表": table, "数据格式": "json",
+        })
+        assert entry is not None and not missing
+        started, msg = self.ingest_svc.start_pipeline(entry["id"])
+        assert started is not None, msg
+        done, msg = self.ingest_svc.complete_pipeline(entry["id"], count)
+        assert done is not None, msg
+        batch_no = done.get("最近批号")
+        assert batch_no, "管道完工应生成批号"
+        return entry["id"], batch_no
+
+    def _add_lineage(self, upstream: str, transform: str, downstream: str) -> int:
+        entry, missing = self.lineage_svc.create_entry({
+            "上游源": upstream, "中间转换": transform, "下游消费": downstream,
+        })
+        assert entry is not None and not missing
+        return entry["id"]
+
+    def test_check_uses_pipeline_reported_count(self):
+        """入湖完成行数以管道上报的批次回执为准，而非湖表注册行数。"""
+        table = "批次核验湖表E"
+        self._register_table(table)
+        rule = self._enable_rule("批次核验规则E", table, 100)
+        _, batch_no = self._run_pipeline("批次核验管道E1", table, 400)
+
+        record, msg = self.quality_svc.check_quality(rule)
+        assert record is not None, msg
+        assert record["batch_no"] == batch_no
+        # 管道写入 400 行，检查必须显示 400，而不是湖表注册条数 1
+        assert record["actual_value"] == 400
+        assert record["passed"] is True
+
+    def test_check_between_two_completions_pins_first_batch(self):
+        """检查在两次完成之间启动：判定锁定先完成批次，其它写入不混入。"""
+        t1, t2 = "批次核验湖表A", "批次核验湖表B"
+        self._register_table(t1)
+        self._register_table(t2)
+        rule_a = self._enable_rule("批次核验规则A", t1, 100)
+        rule_b = self._enable_rule("批次核验规则B", t2, 100)
+        lin_a = self._add_lineage("源系统甲", t1, "报表甲")
+        lin_b = self._add_lineage("源系统乙", t2, "报表乙")
+
+        # 1) 第一批 39 行写入 T1 完成（有缺口：39 < 100）
+        p1, batch1 = self._run_pipeline("批次核验管道A1", t1, 39)
+
+        # 2) 两次完成之间启动检查：锁定第一批
+        record, msg = self.quality_svc.start_check(rule_a)
+        assert record is not None, msg
+        assert record["batch_no"] == batch1
+        assert record["actual_value"] == 39
+        assert record["status"] == "检查中"
+
+        # 3) 检查进行期间：T1 第二批 101 行（刚够标准）完成，T2 同期完成 500 行
+        p2, batch2 = self._run_pipeline("批次核验管道A2", t1, 101)
+        p3, batch3 = self._run_pipeline("批次核验管道B1", t2, 500)
+        assert len({batch1, batch2, batch3}) == 3
+
+        # 4) 完成检查：判定仍针对第一批 39 行，后续写入不得混入
+        finished, msg = self.quality_svc.finish_check(rule_a)
+        assert finished is not None, msg
+        assert finished["batch_no"] == batch1
+        assert finished["actual_value"] == 39  # 不是 1（注册行数），不是 101，不是 140
+        assert finished["passed"] is False
+        assert finished["status"] == "已完成"
+
+        # 管道回执与检查记录引用同一个已完成批次
+        p1_entry = store.find("ingest_pipeline", p1)
+        receipt = p1_entry.get("质量回执")
+        assert receipt is not None, "判定应回写原管道"
+        assert receipt["批号"] == batch1 == finished["batch_no"]
+        assert receipt["实际行数"] == 39
+        assert receipt["判定"] == "不通过"
+        # 第二批所在管道只有批号，尚无判定回执
+        p2_entry = store.find("ingest_pipeline", p2)
+        assert p2_entry.get("最近批号") == batch2
+        assert "质量回执" not in p2_entry
+
+        # 批次回执登记簿：三批各自独立，行数未被合并
+        receipts = {b["batch_no"]: b for b in self.quality_svc.batch_receipts()}
+        assert receipts[batch1]["record_count"] == 39
+        assert receipts[batch1]["status"] == "已核验"
+        assert receipts[batch1]["verdict"] == "不通过"
+        assert receipts[batch2]["record_count"] == 101
+        assert receipts[batch2]["status"] == "已上报"
+        assert receipts[batch3]["record_count"] == 500
+        assert receipts[batch3]["status"] == "已上报"
+
+        # 血缘详情：仅本批真实未达标的 T1 链路列入复查，T2 链路保持完好
+        lin_a_row = store.find("lineage_graph", lin_a)
+        assert lin_a_row["status"] == "待验证"
+        assert lin_a_row.get("复查批号") == batch1
+        lin_b_row = store.find("lineage_graph", lin_b)
+        assert lin_b_row["status"] == "已建立"
+        assert "复查批号" not in lin_b_row
+
+        # 告警：仅一条，保留原批次来源
+        alerts = [a for a in self.quality_svc.alerts() if a["table_name"] == t1]
+        assert len(alerts) == 1
+        assert alerts[0]["batch_no"] == batch1
+        assert alerts[0]["actual_value"] == 39
+
+        # 5) 复查后核验第二批（101 行，刚够标准）：通过，不出具新告警
+        finished2, msg = self.quality_svc.check_quality(rule_a)
+        assert finished2 is not None, msg
+        assert finished2["batch_no"] == batch2
+        assert finished2["actual_value"] == 101
+        assert finished2["passed"] is True
+        p2_entry = store.find("ingest_pipeline", p2)
+        assert p2_entry["质量回执"]["批号"] == batch2
+        assert p2_entry["质量回执"]["判定"] == "通过"
+        alerts = [a for a in self.quality_svc.alerts() if a["table_name"] == t1]
+        assert len(alerts) == 1 and alerts[0]["batch_no"] == batch1
+        lin_a_row = store.find("lineage_graph", lin_a)
+        assert lin_a_row.get("复查批号") == batch1, "通过的批次不应改写复查标记"
+
+        # 6) 另一张表的批次独立核验：通过且不牵连 T1 链路
+        finished3, msg = self.quality_svc.check_quality(rule_b)
+        assert finished3 is not None, msg
+        assert finished3["batch_no"] == batch3
+        assert finished3["actual_value"] == 500
+        assert finished3["passed"] is True
+        lin_b_row = store.find("lineage_graph", lin_b)
+        assert lin_b_row["status"] == "已建立"
+
+    def test_duplicate_batch_receipt_recorded_once(self):
+        """同批完成回执重复提交：质量核验只记一次，告警保留原批次来源。"""
+        table = "批次核验湖表C"
+        self._register_table(table)
+        rule = self._enable_rule("批次核验规则C", table, 100)
+        self._add_lineage("源系统丙", table, "报表丙")
+        p1, batch1 = self._run_pipeline("批次核验管道C1", table, 39)
+
+        # 首次核验：39 < 100 不通过，出具一条告警
+        finished, msg = self.quality_svc.check_quality(rule)
+        assert finished is not None and finished["passed"] is False
+        receipt_before = self.quality_svc.batch_receipt(batch1)
+        assert receipt_before["status"] == "已核验"
+        checked_at = receipt_before["checked_at"]
+
+        # 管道侧同批完成回执重复提交
+        again, msg = self.ingest_svc.complete_pipeline(p1, 39, batch_no=batch1)
+        assert again is not None
+        assert "重复提交" in msg
+
+        # 监控侧同批回执重复登记（即便行数被篡改也不覆盖原记录）
+        receipt, created, note = self.quality_svc.receive_batch_receipt({
+            "batch_no": batch1, "pipeline_id": p1, "table_name": table,
+            "record_count": 999,
+        })
+        assert created is False
+        assert receipt["record_count"] == 39
+
+        # 质量核验只记一次：批次、检查记录、告警均不重复，批次来源不变
+        assert len([b for b in self.quality_svc.batch_receipts() if b["batch_no"] == batch1]) == 1
+        checks = [c for c in self.quality_svc.check_records() if c["batch_no"] == batch1]
+        assert len(checks) == 1
+        alerts = [a for a in self.quality_svc.alerts() if a["batch_no"] == batch1]
+        assert len(alerts) == 1
+        assert alerts[0]["actual_value"] == 39
+        receipt_after = self.quality_svc.batch_receipt(batch1)
+        assert receipt_after["verdict"] == "不通过"
+        assert receipt_after["checked_at"] == checked_at
